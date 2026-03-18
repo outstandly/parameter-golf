@@ -66,6 +66,7 @@ class Hyperparameters:
     # Model (defaults match the current baseline setup).
     vocab_size: int = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers: int = int(os.environ.get("NUM_LAYERS", 9))
+    num_unique_layers: int = int(os.environ.get("NUM_UNIQUE_LAYERS", os.environ.get("NUM_LAYERS", 9)))
     model_dim: int = int(os.environ.get("MODEL_DIM", 512))
     num_heads: int = int(os.environ.get("NUM_HEADS", 8))
     num_kv_heads: int = int(os.environ.get("NUM_KV_HEADS", 4))
@@ -362,16 +363,20 @@ class Block(nn.Module):
         self.mlp_norm = RMSNormNoWeight()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
-        self.attn_scale = mx.ones((dim,), dtype=mx.float32)
-        self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
-        self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
 
-    def __call__(self, x: mx.array, x0: mx.array) -> mx.array:
-        mix = self.resid_mix.astype(x.dtype)
+    def __call__(
+        self,
+        x: mx.array,
+        x0: mx.array,
+        resid_mix: mx.array,
+        attn_scale: mx.array,
+        mlp_scale: mx.array,
+    ) -> mx.array:
+        mix = resid_mix.astype(x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        x = x + attn_scale.astype(x.dtype)[None, None, :] * attn_out
+        x = x + mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
 
@@ -380,23 +385,33 @@ class GPT(nn.Module):
     # - encoder half accumulates skip tensors
     # - decoder half consumes reversed skips with learned skip_weights
     # - tied embeddings for the LM head (the baseline default setup)
-    def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
-                 logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float):
+    def __init__(self, vocab_size: int, num_layers: int, num_unique_layers: int, dim: int, num_heads: int,
+                 num_kv_heads: int, mlp_mult: int, logit_chunk_tokens: int, logit_softcap: float,
+                 rope_base: float, tied_embed_init_std: float, qk_gain_init: float):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
+        if not 1 <= num_unique_layers <= num_layers:
+            raise ValueError(
+                f"num_unique_layers must be in [1, num_layers], got {num_unique_layers} for num_layers={num_layers}"
+            )
         self.logit_chunk_tokens = logit_chunk_tokens
         self.logit_softcap = logit_softcap
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
+        self.num_unique_layers = num_unique_layers
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
+        self.attn_scales = mx.ones((num_layers, dim), dtype=mx.float32)
+        self.mlp_scales = mx.ones((num_layers, dim), dtype=mx.float32)
+        resid_init = np.zeros((num_layers, 2, dim), dtype=np.float32)
+        resid_init[:, 0, :] = 1.0
+        self.resid_mixes = mx.array(resid_init)
         self.blocks = [
             Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
-            for i in range(num_layers)
+            for i in range(num_unique_layers)
         ]
         self.final_norm = RMSNormNoWeight()
 
@@ -417,15 +432,28 @@ class GPT(nn.Module):
         skips: list[mx.array] = []
 
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            x = self.blocks[i % self.num_unique_layers](
+                x,
+                x0,
+                self.resid_mixes[i],
+                self.attn_scales[i],
+                self.mlp_scales[i],
+            )
             skips.append(x)
         for i in range(self.num_decoder_layers):
+            layer_idx = self.num_encoder_layers + i
             # Odd layer counts have one more decoder block than encoder block. The baseline only
             # applies a skip connection when one exists, then runs the remaining decoder block(s)
             # without an added skip.
             if skips:
                 x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            x = self.blocks[layer_idx % self.num_unique_layers](
+                x,
+                x0,
+                self.resid_mixes[layer_idx],
+                self.attn_scales[layer_idx],
+                self.mlp_scales[layer_idx],
+            )
         return self.final_norm(x)
 
     def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
@@ -495,7 +523,11 @@ class SplitOptimizers:
         self.scalar_keys = [
             k
             for k, p in params.items()
-            if k == "skip_weights" or (k.startswith("blocks.") and (p.ndim < 2 or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)))
+            if k != self.embed_key and (
+                k == "skip_weights"
+                or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+                or (k.startswith("blocks.") and p.ndim < 2)
+            )
         ]
 
         self.muon = Muon(self.matrix_keys, params, args)
@@ -548,10 +580,10 @@ MX_DTYPE_FROM_NAME = {
     "bfloat16": mx.bfloat16,
 }
 
-INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
+INT8_KEEP_FLOAT_MAX_NUMEL = int(os.environ.get("INT8_KEEP_FLOAT_MAX_NUMEL", 65_536))
 INT8_KEEP_FLOAT_STORE_DTYPE = np.float16
 INT8_PER_ROW_SCALE_DTYPE = np.float16
-INT8_CLIP_PERCENTILE = 99.99984
+INT8_CLIP_PERCENTILE = float(os.environ.get("INT8_CLIP_PERCENTILE", 99.99984))
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
 
 
@@ -876,6 +908,7 @@ def main() -> None:
     model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
+        num_unique_layers=args.num_unique_layers,
         dim=args.model_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
@@ -921,7 +954,8 @@ def main() -> None:
     log(f"tokenizer_path:{args.tokenizer_path}")
     log(
         f"model_params:{n_params} vocab_size:{args.vocab_size} layers:{args.num_layers} "
-        f"dim:{args.model_dim} heads:{args.num_heads} kv_heads:{args.num_kv_heads} "
+        f"unique_layers:{args.num_unique_layers} dim:{args.model_dim} "
+        f"heads:{args.num_heads} kv_heads:{args.num_kv_heads} "
         f"seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings}"
     )
     log(
