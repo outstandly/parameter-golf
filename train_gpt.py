@@ -627,21 +627,37 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        use_internal_controls: bool,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
+        self.use_internal_controls = use_internal_controls
+        if use_internal_controls:
+            self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+            self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+            self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        else:
+            self.register_parameter("attn_scale", None)
+            self.register_parameter("mlp_scale", None)
+            self.register_parameter("resid_mix", None)
 
     def forward(
         self,
         x: Tensor,
         x0: Tensor,
-        resid_mix: Tensor,
-        attn_scale: Tensor,
-        mlp_scale: Tensor,
+        resid_mix: Tensor | None = None,
+        attn_scale: Tensor | None = None,
+        mlp_scale: Tensor | None = None,
     ) -> Tensor:
+        if self.use_internal_controls:
+            resid_mix = self.resid_mix
+            attn_scale = self.attn_scale
+            mlp_scale = self.mlp_scale
+        elif resid_mix is None or attn_scale is None or mlp_scale is None:
+            raise ValueError("Shared-weight blocks require explicit control tensors")
         mix = resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x))
@@ -678,28 +694,49 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_unique_layers = num_unique_layers
+        self.uses_shared_layer_weights = num_unique_layers < num_layers
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-        self.attn_scales = nn.Parameter(torch.ones(num_layers, model_dim, dtype=torch.float32))
-        self.mlp_scales = nn.Parameter(torch.ones(num_layers, model_dim, dtype=torch.float32))
-        resid_init = torch.zeros(num_layers, 2, model_dim, dtype=torch.float32)
-        resid_init[:, 0, :] = 1.0
-        self.resid_mixes = nn.Parameter(resid_init)
-        self.blocks = nn.ModuleList(
-            [
-                Block(
-                    model_dim,
-                    num_heads,
-                    num_kv_heads,
-                    mlp_mult,
-                    rope_base,
-                    qk_gain_init,
-                )
-                for i in range(self.num_unique_layers)
-            ]
-        )
+        if self.uses_shared_layer_weights:
+            self.attn_scales = nn.Parameter(torch.ones(num_layers, model_dim, dtype=torch.float32))
+            self.mlp_scales = nn.Parameter(torch.ones(num_layers, model_dim, dtype=torch.float32))
+            resid_init = torch.zeros(num_layers, 2, model_dim, dtype=torch.float32)
+            resid_init[:, 0, :] = 1.0
+            self.resid_mixes = nn.Parameter(resid_init)
+            self.blocks = nn.ModuleList(
+                [
+                    Block(
+                        model_dim,
+                        num_heads,
+                        num_kv_heads,
+                        mlp_mult,
+                        rope_base,
+                        qk_gain_init,
+                        use_internal_controls=False,
+                    )
+                    for _ in range(self.num_unique_layers)
+                ]
+            )
+        else:
+            self.register_parameter("attn_scales", None)
+            self.register_parameter("mlp_scales", None)
+            self.register_parameter("resid_mixes", None)
+            self.blocks = nn.ModuleList(
+                [
+                    Block(
+                        model_dim,
+                        num_heads,
+                        num_kv_heads,
+                        mlp_mult,
+                        rope_base,
+                        qk_gain_init,
+                        use_internal_controls=True,
+                    )
+                    for _ in range(num_layers)
+                ]
+            )
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -720,26 +757,36 @@ class GPT(nn.Module):
         skips: list[Tensor] = []
 
         # First half stores skips; second half reuses them in reverse order.
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i % self.num_unique_layers](
-                x,
-                x0,
-                self.resid_mixes[i],
-                self.attn_scales[i],
-                self.mlp_scales[i],
-            )
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            layer_idx = self.num_encoder_layers + i
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[layer_idx % self.num_unique_layers](
-                x,
-                x0,
-                self.resid_mixes[layer_idx],
-                self.attn_scales[layer_idx],
-                self.mlp_scales[layer_idx],
-            )
+        if self.uses_shared_layer_weights:
+            for i in range(self.num_encoder_layers):
+                x = self.blocks[i % self.num_unique_layers](
+                    x,
+                    x0,
+                    self.resid_mixes[i],
+                    self.attn_scales[i],
+                    self.mlp_scales[i],
+                )
+                skips.append(x)
+            for i in range(self.num_decoder_layers):
+                layer_idx = self.num_encoder_layers + i
+                if skips:
+                    x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                x = self.blocks[layer_idx % self.num_unique_layers](
+                    x,
+                    x0,
+                    self.resid_mixes[layer_idx],
+                    self.attn_scales[layer_idx],
+                    self.mlp_scales[layer_idx],
+                )
+        else:
+            for i in range(self.num_encoder_layers):
+                x = self.blocks[i](x, x0)
+                skips.append(x)
+            for i in range(self.num_decoder_layers):
+                layer_idx = self.num_encoder_layers + i
+                if skips:
+                    x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                x = self.blocks[layer_idx](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -889,7 +936,8 @@ def main() -> None:
         for name, p in block_named_params
         if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
-    scalar_params.extend([base_model.attn_scales, base_model.mlp_scales, base_model.resid_mixes])
+    if base_model.uses_shared_layer_weights:
+        scalar_params.extend([base_model.attn_scales, base_model.mlp_scales, base_model.resid_mixes])
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr

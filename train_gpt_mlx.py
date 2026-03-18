@@ -357,21 +357,38 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        use_internal_controls: bool,
     ):
         super().__init__()
         self.attn_norm = RMSNormNoWeight()
         self.mlp_norm = RMSNormNoWeight()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
+        self.use_internal_controls = use_internal_controls
+        if use_internal_controls:
+            self.attn_scale = mx.ones((dim,), dtype=mx.float32)
+            self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
+            resid_init = np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32)))
+            self.resid_mix = mx.array(resid_init)
+        else:
+            self.attn_scale = None
+            self.mlp_scale = None
+            self.resid_mix = None
 
     def __call__(
         self,
         x: mx.array,
         x0: mx.array,
-        resid_mix: mx.array,
-        attn_scale: mx.array,
-        mlp_scale: mx.array,
+        resid_mix: mx.array | None = None,
+        attn_scale: mx.array | None = None,
+        mlp_scale: mx.array | None = None,
     ) -> mx.array:
+        if self.use_internal_controls:
+            resid_mix = self.resid_mix
+            attn_scale = self.attn_scale
+            mlp_scale = self.mlp_scale
+        elif resid_mix is None or attn_scale is None or mlp_scale is None:
+            raise ValueError("Shared-weight blocks require explicit control tensors")
         mix = resid_mix.astype(x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x))
@@ -400,19 +417,29 @@ class GPT(nn.Module):
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
         self.num_unique_layers = num_unique_layers
+        self.uses_shared_layer_weights = num_unique_layers < num_layers
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
-        self.attn_scales = mx.ones((num_layers, dim), dtype=mx.float32)
-        self.mlp_scales = mx.ones((num_layers, dim), dtype=mx.float32)
-        resid_init = np.zeros((num_layers, 2, dim), dtype=np.float32)
-        resid_init[:, 0, :] = 1.0
-        self.resid_mixes = mx.array(resid_init)
-        self.blocks = [
-            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
-            for i in range(num_unique_layers)
-        ]
+        if self.uses_shared_layer_weights:
+            self.attn_scales = mx.ones((num_layers, dim), dtype=mx.float32)
+            self.mlp_scales = mx.ones((num_layers, dim), dtype=mx.float32)
+            resid_init = np.zeros((num_layers, 2, dim), dtype=np.float32)
+            resid_init[:, 0, :] = 1.0
+            self.resid_mixes = mx.array(resid_init)
+            self.blocks = [
+                Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, use_internal_controls=False)
+                for _ in range(num_unique_layers)
+            ]
+        else:
+            self.attn_scales = None
+            self.mlp_scales = None
+            self.resid_mixes = None
+            self.blocks = [
+                Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, use_internal_controls=True)
+                for _ in range(num_layers)
+            ]
         self.final_norm = RMSNormNoWeight()
 
         for b in self.blocks:
@@ -431,29 +458,39 @@ class GPT(nn.Module):
         x0 = x
         skips: list[mx.array] = []
 
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i % self.num_unique_layers](
-                x,
-                x0,
-                self.resid_mixes[i],
-                self.attn_scales[i],
-                self.mlp_scales[i],
-            )
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            layer_idx = self.num_encoder_layers + i
-            # Odd layer counts have one more decoder block than encoder block. The baseline only
-            # applies a skip connection when one exists, then runs the remaining decoder block(s)
-            # without an added skip.
-            if skips:
-                x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[layer_idx % self.num_unique_layers](
-                x,
-                x0,
-                self.resid_mixes[layer_idx],
-                self.attn_scales[layer_idx],
-                self.mlp_scales[layer_idx],
-            )
+        if self.uses_shared_layer_weights:
+            for i in range(self.num_encoder_layers):
+                x = self.blocks[i % self.num_unique_layers](
+                    x,
+                    x0,
+                    self.resid_mixes[i],
+                    self.attn_scales[i],
+                    self.mlp_scales[i],
+                )
+                skips.append(x)
+            for i in range(self.num_decoder_layers):
+                layer_idx = self.num_encoder_layers + i
+                # Odd layer counts have one more decoder block than encoder block. The baseline only
+                # applies a skip connection when one exists, then runs the remaining decoder block(s)
+                # without an added skip.
+                if skips:
+                    x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
+                x = self.blocks[layer_idx % self.num_unique_layers](
+                    x,
+                    x0,
+                    self.resid_mixes[layer_idx],
+                    self.attn_scales[layer_idx],
+                    self.mlp_scales[layer_idx],
+                )
+        else:
+            for i in range(self.num_encoder_layers):
+                x = self.blocks[i](x, x0)
+                skips.append(x)
+            for i in range(self.num_decoder_layers):
+                layer_idx = self.num_encoder_layers + i
+                if skips:
+                    x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
+                x = self.blocks[layer_idx](x, x0)
         return self.final_norm(x)
 
     def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
