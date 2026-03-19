@@ -352,6 +352,21 @@ INT8_KEEP_FLOAT_NAME_PATTERNS = tuple(
     ).split(",")
     if pattern
 )
+INT8_KEEP_FLOAT_PATTERN_CANDIDATES = tuple(
+    tuple(pattern for pattern in candidate.split(",") if pattern)
+    for candidate in os.environ.get(
+        "INT8_KEEP_FLOAT_PATTERN_CANDIDATES",
+        (
+            "tok_emb.weight,blocks.8.mlp.fc.weight,blocks.8.mlp.proj.weight,blocks.8.attn.proj.weight;"
+            "tok_emb.weight,blocks.8.mlp.fc.weight,blocks.8.mlp.proj.weight;"
+            "tok_emb.weight,blocks.8.mlp.fc.weight,blocks.8.attn.proj.weight;"
+            "tok_emb.weight,blocks.8.mlp.fc.weight;"
+            "tok_emb.weight,blocks.8.mlp.proj.weight;"
+            "tok_emb.weight,blocks.8.attn.proj.weight;"
+            "tok_emb.weight;"
+        ),
+    ).split(";")
+)
 INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
@@ -366,12 +381,18 @@ INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_GROUP_SIZE = int(os.environ.get("INT8_GROUP_SIZE", 2))
 INT8_CLIP_PERCENTILE = float(os.environ.get("INT8_CLIP_PERCENTILE", 99.99995))
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+INT8_SUBMISSION_SIZE_LIMIT_BYTES = int(os.environ.get("INT8_SUBMISSION_SIZE_LIMIT_BYTES", 16_000_000))
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
 
-def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, str]) -> Tensor:
-    if any(pattern in name for pattern in INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
+def keep_float_tensor(
+    name: str,
+    t: Tensor,
+    passthrough_orig_dtypes: dict[str, str],
+    keep_float_fp32_name_patterns: tuple[str, ...],
+) -> Tensor:
+    if any(pattern in name for pattern in keep_float_fp32_name_patterns):
         return t.float().contiguous()
     if t.dtype in {torch.float32, torch.bfloat16}:
         passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
@@ -416,7 +437,12 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor, dict[str, object] 
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
     return q, scale, None
 
-def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
+def quantize_state_dict_int8(
+    state_dict: dict[str, Tensor],
+    *,
+    keep_float_name_patterns: tuple[str, ...] = INT8_KEEP_FLOAT_NAME_PATTERNS,
+    keep_float_fp32_name_patterns: tuple[str, ...] = INT8_KEEP_FLOAT_FP32_NAME_PATTERNS,
+):
     # Single supported clean-script export format:
     # - per-row int8 for 2D float tensors
     # - per-tensor int8 for other float tensors
@@ -447,8 +473,8 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
 
         # Small float tensors are cheap enough to keep directly. We still downcast
         # fp32/bf16 passthrough tensors to fp16 so metadata does not dominate size.
-        if any(pattern in name for pattern in INT8_KEEP_FLOAT_NAME_PATTERNS) or t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
-            kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
+        if any(pattern in name for pattern in keep_float_name_patterns) or t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
+            kept = keep_float_tensor(name, t, passthrough_orig_dtypes, keep_float_fp32_name_patterns)
             passthrough[name] = kept
             stats["int8_payload_bytes"] += tensor_nbytes(kept)
             continue
@@ -1246,18 +1272,53 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
-    quant_buf = io.BytesIO()
-    torch.save(quant_obj, quant_buf)
-    quant_raw = quant_buf.getvalue()
-    quant_blob = zlib.compress(quant_raw, level=9)
-    quant_raw_bytes = len(quant_raw)
+    quant_candidates = INT8_KEEP_FLOAT_PATTERN_CANDIDATES if INT8_KEEP_FLOAT_PATTERN_CANDIDATES else (INT8_KEEP_FLOAT_NAME_PATTERNS,)
+    seen_candidates: set[tuple[str, ...]] = set()
+    ordered_candidates: list[tuple[str, ...]] = []
+    for candidate in [*quant_candidates, INT8_KEEP_FLOAT_NAME_PATTERNS, tuple()]:
+        if candidate in seen_candidates:
+            continue
+        seen_candidates.add(candidate)
+        ordered_candidates.append(candidate)
+
+    quant_blob = b""
+    quant_stats = None
+    quant_raw_bytes = 0
+    selected_keep_float_patterns: tuple[str, ...] = tuple()
     if master_process:
+        code_bytes = len(code.encode("utf-8"))
+        best_candidate = None
+        state_dict = base_model.state_dict()
+        for candidate in ordered_candidates:
+            candidate_obj, candidate_stats = quantize_state_dict_int8(
+                state_dict,
+                keep_float_name_patterns=candidate,
+                keep_float_fp32_name_patterns=INT8_KEEP_FLOAT_FP32_NAME_PATTERNS,
+            )
+            candidate_buf = io.BytesIO()
+            torch.save(candidate_obj, candidate_buf)
+            candidate_raw = candidate_buf.getvalue()
+            candidate_blob = zlib.compress(candidate_raw, level=9)
+            candidate_total_bytes = len(candidate_blob) + code_bytes
+            candidate_label = ",".join(candidate) if candidate else "<none>"
+            log0(
+                f"int8_candidate keep_float:{candidate_label} "
+                f"artifact_bytes:{len(candidate_blob)} total_bytes:{candidate_total_bytes}"
+            )
+            if candidate_total_bytes <= INT8_SUBMISSION_SIZE_LIMIT_BYTES:
+                best_candidate = (candidate, candidate_obj, candidate_stats, candidate_blob, len(candidate_raw))
+                break
+        if best_candidate is None:
+            raise RuntimeError(
+                f"No int8 export candidate fit within {INT8_SUBMISSION_SIZE_LIMIT_BYTES} bytes"
+            )
+        selected_keep_float_patterns, quant_obj, quant_stats, quant_blob, quant_raw_bytes = best_candidate
         with open("final_model.int8.ptz", "wb") as f:
             f.write(quant_blob)
         quant_file_bytes = os.path.getsize("final_model.int8.ptz")
-        code_bytes = len(code.encode("utf-8"))
         ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
+        selected_label = ",".join(selected_keep_float_patterns) if selected_keep_float_patterns else "<none>"
+        log0(f"int8_selected keep_float:{selected_label}")
         log0(
             f"Serialized model int8+zlib: {quant_file_bytes} bytes "
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
