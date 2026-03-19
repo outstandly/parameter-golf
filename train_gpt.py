@@ -354,6 +354,7 @@ INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
 INT8_KEEP_FLOAT_MAX_NUMEL = int(os.environ.get("INT8_KEEP_FLOAT_MAX_NUMEL", 65_536))
 INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
+INT8_GROUP_SIZE = int(os.environ.get("INT8_GROUP_SIZE", 0))
 INT8_CLIP_PERCENTILE = float(os.environ.get("INT8_CLIP_PERCENTILE", 99.99984))
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
 
@@ -368,10 +369,27 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
         return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
     return t
 
-def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
+def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor, dict[str, object] | None]:
     t32 = t.float()
     if t32.ndim == 2:
-        # Matrices get one scale per row, which usually tracks output-channel
+        if INT8_GROUP_SIZE > 0 and t32.shape[1] > INT8_GROUP_SIZE:
+            rows, cols = t32.shape
+            group_size = INT8_GROUP_SIZE
+            num_groups = (cols + group_size - 1) // group_size
+            q = torch.empty_like(t32, dtype=torch.int8)
+            scales = torch.empty((rows, num_groups), dtype=INT8_PER_ROW_SCALE_DTYPE)
+            for group_idx in range(num_groups):
+                start = group_idx * group_size
+                end = min(start + group_size, cols)
+                chunk = t32[:, start:end]
+                clip_abs = torch.quantile(chunk.abs(), INT8_CLIP_Q, dim=1) if chunk.numel() else torch.zeros(rows)
+                clipped = torch.maximum(torch.minimum(chunk, clip_abs[:, None]), -clip_abs[:, None])
+                scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
+                q[:, start:end] = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8)
+                scales[:, group_idx] = scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE)
+            return q.contiguous(), scales.contiguous(), {"scheme": "per_row_group", "axis": 1, "group_size": group_size}
+
+        # Matrices get one scale per row by default, which usually tracks output-channel
         # ranges much better than a single tensor-wide scale.
         clip_abs = (
             torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
@@ -381,13 +399,13 @@ def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
         clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
         scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
         q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8).contiguous()
-        return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
+        return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous(), {"scheme": "per_row", "axis": 0}
 
     # Vectors / scalars use a simpler per-tensor scale.
     clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
     scale = torch.tensor(clip_abs / 127.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
-    return q, scale
+    return q, scale, None
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
     # Single supported clean-script export format:
@@ -427,9 +445,9 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
             continue
 
         stats["num_float_tensors"] += 1
-        q, s = quantize_float_tensor(t)
-        if s.ndim > 0:
-            qmeta[name] = {"scheme": "per_row", "axis": 0}
+        q, s, meta = quantize_float_tensor(t)
+        if meta is not None:
+            qmeta[name] = meta
         quantized[name] = q
         scales[name] = s
         dtypes[name] = str(t.dtype).removeprefix("torch.")
@@ -455,9 +473,21 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     for name, q in obj["quantized"].items():
         dtype = getattr(torch, obj["dtypes"][name])
         s = obj["scales"][name]
-        if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
+        meta = qmeta.get(name, {})
+        if meta.get("scheme") == "per_row_group":
             s = s.to(dtype=torch.float32)
+            group_size = int(meta["group_size"])
+            rows, cols = q.shape
+            out_t = torch.empty((rows, cols), dtype=torch.float32)
+            num_groups = s.shape[1]
+            for group_idx in range(num_groups):
+                start = group_idx * group_size
+                end = min(start + group_size, cols)
+                out_t[:, start:end] = q[:, start:end].float() * s[:, group_idx].view(rows, 1)
+            out[name] = out_t.to(dtype=dtype).contiguous()
+        elif meta.get("scheme") == "per_row" or s.ndim > 0:
             # Broadcast the saved row scale back across trailing dimensions.
+            s = s.to(dtype=torch.float32)
             out[name] = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype=dtype).contiguous()
         else:
             scale = float(s.item())
