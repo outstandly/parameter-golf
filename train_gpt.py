@@ -338,27 +338,41 @@ def eval_val(
         else:
             if args.eval_mode not in {"chunked", "sliding"}:
                 raise ValueError(f"Unsupported EVAL_MODE={args.eval_mode}")
-            if not args.eval_doc_isolated:
-                raise ValueError("Custom eval path currently requires EVAL_DOC_ISOLATED=1")
-            if bos_token_id < 0:
-                raise ValueError("SentencePiece tokenizer must define BOS for doc-isolated eval")
             if args.eval_seq_len <= 0:
                 raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
             if args.eval_mode == "sliding" and args.eval_stride <= 0:
                 raise ValueError(f"EVAL_STRIDE must be positive for sliding eval, got {args.eval_stride}")
-
-            doc_starts = (val_tokens == bos_token_id).nonzero(as_tuple=False).flatten().tolist()
-            if not doc_starts:
-                raise ValueError("Could not find any BOS-delimited validation documents")
-            if doc_starts[0] != 0:
-                doc_starts.insert(0, 0)
-            doc_ends = [*doc_starts[1:], int(val_tokens.numel())]
-            doc_ranges = list(zip(doc_starts, doc_ends, strict=True))
-            doc_start = (len(doc_ranges) * rank) // world_size
-            doc_end = (len(doc_ranges) * (rank + 1)) // world_size
             chunk_targets = args.eval_seq_len if args.eval_mode == "chunked" else args.eval_stride
             batch_items: list[tuple[Tensor, Tensor, int]] = []
             batch_input_tokens = 0
+            spans: list[tuple[int, int, int, int]] = []
+
+            if args.eval_doc_isolated:
+                if bos_token_id < 0:
+                    raise ValueError("SentencePiece tokenizer must define BOS for doc-isolated eval")
+                doc_starts = (val_tokens == bos_token_id).nonzero(as_tuple=False).flatten().tolist()
+                if not doc_starts:
+                    raise ValueError("Could not find any BOS-delimited validation documents")
+                if doc_starts[0] != 0:
+                    doc_starts.insert(0, 0)
+                doc_ends = [*doc_starts[1:], int(val_tokens.numel())]
+                doc_ranges = list(zip(doc_starts, doc_ends, strict=True))
+                doc_start = (len(doc_ranges) * rank) // world_size
+                doc_end = (len(doc_ranges) * (rank + 1)) // world_size
+                spans = [
+                    (raw_start, raw_end, raw_start + 1, raw_end)
+                    for raw_start, raw_end in doc_ranges[doc_start:doc_end]
+                ]
+            else:
+                total_targets = val_tokens.numel() - 1
+                spans = [
+                    (
+                        0,
+                        int(val_tokens.numel()),
+                        1 + (total_targets * rank) // world_size,
+                        1 + (total_targets * (rank + 1)) // world_size,
+                    )
+                ]
 
             def flush_batch() -> None:
                 nonlocal batch_items, batch_input_tokens, val_loss_sum, val_token_count, val_byte_count
@@ -391,18 +405,15 @@ def eval_val(
                 batch_items = []
                 batch_input_tokens = 0
 
-            for raw_start, raw_end in doc_ranges[doc_start:doc_end]:
-                doc = val_tokens[raw_start:raw_end]
-                doc_len = int(doc.numel())
-                if doc_len <= 1:
+            for span_start, span_end, target_start, target_limit in spans:
+                if target_limit <= target_start:
                     continue
-                target_start = 1
-                while target_start < doc_len:
-                    target_end = min(target_start + chunk_targets, doc_len)
+                while target_start < target_limit:
+                    target_end = min(target_start + chunk_targets, target_limit)
                     context_start = target_start - 1
                     if args.eval_mode == "sliding":
-                        context_start = max(0, target_end - args.eval_seq_len - 1)
-                    window = doc[context_start:target_end]
+                        context_start = max(span_start, target_end - args.eval_seq_len - 1)
+                    window = val_tokens[context_start:target_end]
                     x = window[:-1]
                     y = window[1:]
                     score_start = target_start - (context_start + 1)
