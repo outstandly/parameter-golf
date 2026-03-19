@@ -28,15 +28,6 @@ from init_utils import overtone_spectral_init_
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-# -----------------------------
-# HYPERPARAMETERS
-# -----------------------------
-# Default Simple Baseline run:
-# - 9 transformer blocks at width 512
-# - 8 attention heads with 4 KV heads (GQA) and 2x MLP expansion
-# - vocab size 1024, sequence length 1024, tied embeddings
-# - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
-
 class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
@@ -94,16 +85,7 @@ class Hyperparameters:
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
-# -----------------------------
-# MUON OPTIMIZER 
-# -----------------------------
-# 
-# As borrowed from modded-nanogpt
-# Background on Muon: https://kellerjordan.github.io/posts/muon/
-
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
-    # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
-    # Muon uses this to normalize matrix-shaped gradients before applying them.
     a, b, c = (3.4445, -4.7750, 2.0315)
     X = G.bfloat16()
     X /= X.norm() + eps
@@ -238,15 +220,6 @@ class Muon(torch.optim.Optimizer):
         return loss
 
 
-# -----------------------------
-# TOKENIZER-AGNOSTIC EVALUATION SETUP 
-# -----------------------------
-#
-# It's common for small models have a large fraction of their parameters be embeddings, since the 2 * d_model * d_vocab vectors can be gigantic.
-# Instead of locking the tokenizer, we let you bring your own and calculate our validation metrics on the average compression of the validation set.
-# We calculate BPB (bits-per-byte) instead of validation loss, so we need methods to count the number of bits per token in the tokenizer.
-# Note: Submissions that edit the tokenizer will be examined more carefully, since screwing this up might unjustly improve your score.
-
 def build_sentencepiece_luts(
     sp: spm.SentencePieceProcessor, vocab_size: int, device: torch.device
 ) -> tuple[Tensor, Tensor, Tensor]:
@@ -355,9 +328,55 @@ def eval_val(
                 raise ValueError(f"Unsupported EVAL_MODE={args.eval_mode}")
             if args.eval_seq_len <= 0:
                 raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
-            if args.eval_mode == "sliding" and args.eval_stride <= 0:
-                raise ValueError(f"EVAL_STRIDE must be positive for sliding eval, got {args.eval_stride}")
-            chunk_targets = args.eval_seq_len if args.eval_mode == "chunked" else args.eval_stride
+            if args.eval_mode == "sliding":
+                if args.eval_doc_isolated:
+                    raise ValueError("Sliding eval does not support EVAL_DOC_ISOLATED")
+                if args.eval_stride <= 0:
+                    raise ValueError(f"EVAL_STRIDE must be positive for sliding eval, got {args.eval_stride}")
+                total = val_tokens.numel() - 1
+                windows: list[tuple[int, int]] = []
+                p = 0
+                while p + args.eval_seq_len <= total:
+                    windows.append((p, 0 if p == 0 else (args.eval_seq_len - args.eval_stride)))
+                    p += args.eval_stride
+                per_rank = (len(windows) + world_size - 1) // world_size
+                my_windows = windows[rank * per_rank : min((rank + 1) * per_rank, len(windows))]
+                eval_batch_seqs = 256
+                for i in range(0, len(my_windows), eval_batch_seqs):
+                    batch = my_windows[i : i + eval_batch_seqs]
+                    if not batch:
+                        continue
+                    x_list = [val_tokens[w : w + args.eval_seq_len] for w, _ in batch]
+                    y_list = [val_tokens[w + 1 : w + args.eval_seq_len + 1] for w, _ in batch]
+                    while len(x_list) < eval_batch_seqs:
+                        x_list.append(x_list[-1])
+                        y_list.append(y_list[-1])
+                    x_batch = torch.stack(x_list).to(device=device, dtype=torch.int64, non_blocking=True)
+                    y_batch = torch.stack(y_list).to(device=device, dtype=torch.int64, non_blocking=True)
+                    score_mask = torch.zeros((eval_batch_seqs, args.eval_seq_len), device=device, dtype=torch.bool)
+                    for j, (_, score_start) in enumerate(batch):
+                        score_mask[j, score_start:] = True
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                        logits = eval_model.forward_logits(x_batch)
+                    per_token_loss = F.cross_entropy(
+                        logits.float().reshape(-1, logits.size(-1)),
+                        y_batch.reshape(-1),
+                        reduction="none",
+                    ).reshape_as(y_batch)
+                    val_loss_sum += per_token_loss[score_mask].to(torch.float64).sum()
+                    val_token_count += score_mask.sum().to(torch.float64)
+                    prev_ids = x_batch[score_mask]
+                    tgt_ids = y_batch[score_mask]
+                    token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
+                    token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
+                    val_byte_count += token_bytes.to(torch.float64).sum()
+                if dist.is_available() and dist.is_initialized():
+                    dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
+                    dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
+                model.train()
+                return float((val_loss_sum / val_token_count).item()), float((val_loss_sum.item() / math.log(2.0)) / val_byte_count.item())
+            chunk_targets = args.eval_seq_len
             batch_items: list[tuple[Tensor, Tensor, int]] = []
             batch_input_tokens = 0
             spans: list[tuple[int, int, int, int]] = []
@@ -374,29 +393,18 @@ def eval_val(
                 doc_ranges = list(zip(doc_starts, doc_ends, strict=True))
                 doc_start = (len(doc_ranges) * rank) // world_size
                 doc_end = (len(doc_ranges) * (rank + 1)) // world_size
-                spans = [
-                    (raw_start, raw_end, raw_start + 1, raw_end)
-                    for raw_start, raw_end in doc_ranges[doc_start:doc_end]
-                ]
+                spans = [(raw_start, raw_end, raw_start + 1, raw_end) for raw_start, raw_end in doc_ranges[doc_start:doc_end]]
             else:
                 total_targets = val_tokens.numel() - 1
-                spans = [
-                    (
-                        0,
-                        int(val_tokens.numel()),
-                        1 + (total_targets * rank) // world_size,
-                        1 + (total_targets * (rank + 1)) // world_size,
-                    )
-                ]
+                spans = [(0, int(val_tokens.numel()), 1 + (total_targets * rank) // world_size, 1 + (total_targets * (rank + 1)) // world_size)]
 
             def flush_batch() -> None:
                 nonlocal batch_items, batch_input_tokens, val_loss_sum, val_token_count, val_byte_count
                 if not batch_items:
                     return
                 max_len = max(x.numel() for x, _, _ in batch_items)
-                pad_id = 0
-                x_batch = torch.full((len(batch_items), max_len), pad_id, device=device, dtype=torch.int64)
-                y_batch = torch.full((len(batch_items), max_len), pad_id, device=device, dtype=torch.int64)
+                x_batch = torch.full((len(batch_items), max_len), 0, device=device, dtype=torch.int64)
+                y_batch = torch.full((len(batch_items), max_len), 0, device=device, dtype=torch.int64)
                 score_mask = torch.zeros((len(batch_items), max_len), device=device, dtype=torch.bool)
                 for i, (x, y, score_start) in enumerate(batch_items):
                     n = x.numel()
@@ -405,11 +413,7 @@ def eval_val(
                     score_mask[i, score_start:n] = True
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     logits = eval_model.forward_logits(x_batch)
-                per_token_loss = F.cross_entropy(
-                    logits.float().reshape(-1, logits.size(-1)),
-                    y_batch.reshape(-1),
-                    reduction="none",
-                ).reshape_as(y_batch)
+                per_token_loss = F.cross_entropy(logits.float().reshape(-1, logits.size(-1)), y_batch.reshape(-1), reduction="none").reshape_as(y_batch)
                 val_loss_sum += per_token_loss[score_mask].to(torch.float64).sum()
                 val_token_count += score_mask.sum().to(torch.float64)
                 prev_ids = x_batch[score_mask]
@@ -420,21 +424,15 @@ def eval_val(
                 batch_items = []
                 batch_input_tokens = 0
 
-            for span_start, span_end, target_start, target_limit in spans:
-                if target_limit <= target_start:
-                    continue
+            for span_start, _, target_start, target_limit in spans:
                 while target_start < target_limit:
                     target_end = min(target_start + chunk_targets, target_limit)
-                    context_start = target_start - 1
-                    if args.eval_mode == "sliding":
-                        context_start = max(span_start, target_end - args.eval_seq_len - 1)
-                    window = val_tokens[context_start:target_end]
+                    window = val_tokens[target_start - 1 : target_end]
                     x = window[:-1]
                     y = window[1:]
-                    score_start = target_start - (context_start + 1)
                     if batch_items and batch_input_tokens + int(x.numel()) > local_batch_tokens:
                         flush_batch()
-                    batch_items.append((x, y, score_start))
+                    batch_items.append((x, y, 0))
                     batch_input_tokens += int(x.numel())
                     target_start = target_end
             flush_batch()
@@ -449,14 +447,6 @@ def eval_val(
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
-
-# -----------------------------
-# POST-TRAINING QUANTIZATION
-# -----------------------------
-#
-# It's silly to export our model, which is trained in bf16 and fp32, at that same precision.
-# Instead, we get approximately the same model (with a small hit) by quantizing the model to int8 & zlib compressing.
-# We can then decompress the model and run in higher precision for evaluation, after closing in under the size limit.
 
 CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
