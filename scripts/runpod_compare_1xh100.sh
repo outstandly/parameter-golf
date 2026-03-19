@@ -79,34 +79,30 @@ import sys
 
 path = Path(sys.argv[1])
 text = path.read_text()
+old = """        y = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=None,
+            is_causal=True,
+            enable_gqa=(self.num_kv_heads != self.num_heads),
+        )"""
 
-helper = """
-_orig_scaled_dot_product_attention = F.scaled_dot_product_attention
+new = """        if self.num_kv_heads != self.num_heads:
+            repeats = self.num_heads // self.num_kv_heads
+            k = k.repeat_interleave(repeats, dim=1)
+            v = v.repeat_interleave(repeats, dim=1)
+        y = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=None,
+            is_causal=True,
+        )"""
 
-def scaled_dot_product_attention_compat(query, key, value, **kwargs):
-    try:
-        return _orig_scaled_dot_product_attention(query, key, value, **kwargs)
-    except TypeError:
-        enable_gqa = kwargs.pop("enable_gqa", False)
-        if enable_gqa:
-            q_heads = query.shape[-3]
-            kv_heads = key.shape[-3]
-            if q_heads % kv_heads != 0:
-                raise ValueError(f"q_heads={q_heads} must be divisible by kv_heads={kv_heads}")
-            if q_heads != kv_heads:
-                repeats = q_heads // kv_heads
-                key = key.repeat_interleave(repeats, dim=-3)
-                value = value.repeat_interleave(repeats, dim=-3)
-        return _orig_scaled_dot_product_attention(query, key, value, **kwargs)
-"""
-
-if "def scaled_dot_product_attention_compat(" not in text:
-    marker = "\n\nclass CausalSelfAttention"
-    if marker not in text:
-        raise SystemExit(f"Could not find insertion marker in {path}")
-    text = text.replace(marker, "\n\n" + helper + "\n\nclass CausalSelfAttention", 1)
-
-text = text.replace("F.scaled_dot_product_attention(", "scaled_dot_product_attention_compat(")
+if old not in text:
+    raise SystemExit(f"Could not find attention pattern in {path}")
+text = text.replace(old, new, 1)
 path.write_text(text)
 PY
 }
