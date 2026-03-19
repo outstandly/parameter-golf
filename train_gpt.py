@@ -346,7 +346,10 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
 )
 INT8_KEEP_FLOAT_NAME_PATTERNS = tuple(
     pattern
-    for pattern in os.environ.get("INT8_KEEP_FLOAT_NAME_PATTERNS", "").split(",")
+    for pattern in os.environ.get(
+        "INT8_KEEP_FLOAT_NAME_PATTERNS",
+        "tok_emb.weight,blocks.8.mlp.fc.weight,blocks.8.mlp.proj.weight,blocks.8.attn.proj.weight",
+    ).split(",")
     if pattern
 )
 INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
