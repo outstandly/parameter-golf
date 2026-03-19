@@ -71,6 +71,47 @@ else
   rm -rf "${REPO_COPY}/.git" "${REPO_COPY}/.venv" "${REPO_COPY}/data/datasets" "${REPO_COPY}/data/tokenizers"
 fi
 
+patch_attention_compat() {
+  local file_path="$1"
+  python3 - "${file_path}" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+
+helper = """
+def scaled_dot_product_attention_compat(query, key, value, **kwargs):
+    try:
+        return F.scaled_dot_product_attention(query, key, value, **kwargs)
+    except TypeError:
+        enable_gqa = kwargs.pop("enable_gqa", False)
+        if enable_gqa:
+            q_heads = query.shape[-3]
+            kv_heads = key.shape[-3]
+            if q_heads % kv_heads != 0:
+                raise ValueError(f"q_heads={q_heads} must be divisible by kv_heads={kv_heads}")
+            if q_heads != kv_heads:
+                repeats = q_heads // kv_heads
+                key = key.repeat_interleave(repeats, dim=-3)
+                value = value.repeat_interleave(repeats, dim=-3)
+        return F.scaled_dot_product_attention(query, key, value, **kwargs)
+"""
+
+if "def scaled_dot_product_attention_compat(" not in text:
+    marker = "\n\nclass CausalSelfAttention"
+    if marker not in text:
+        raise SystemExit(f"Could not find insertion marker in {path}")
+    text = text.replace(marker, "\n\n" + helper + "\n\nclass CausalSelfAttention", 1)
+
+text = text.replace("F.scaled_dot_product_attention(", "scaled_dot_product_attention_compat(")
+path.write_text(text)
+PY
+}
+
+patch_attention_compat "${REPO_COPY}/train_gpt.py"
+patch_attention_compat "${REPO_COPY}/records/track_10min_16mb/2026-03-17_NaiveBaseline/train_gpt.py"
+
 run_job() {
   local run_id="$1"
   local script_path="$2"
