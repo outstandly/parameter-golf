@@ -43,6 +43,7 @@ class Hyperparameters:
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
     tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
+    load_state_dict_path = os.environ.get("LOAD_STATE_DICT_PATH", "")
     seed = int(os.environ.get("SEED", 1337))
 
     # Validation cadence and batch size. Validation always uses the full fineweb_val split.
@@ -992,6 +993,9 @@ def main() -> None:
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
     ).to(device).bfloat16()
+    if args.load_state_dict_path:
+        state_dict = torch.load(args.load_state_dict_path, map_location="cpu")
+        base_model.load_state_dict(state_dict, strict=True)
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
@@ -1067,6 +1071,8 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    if args.load_state_dict_path:
+        log0(f"loaded_state_dict:{args.load_state_dict_path}")
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
