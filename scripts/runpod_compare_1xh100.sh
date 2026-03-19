@@ -14,6 +14,7 @@ REPO_SRC="${REPO_SRC:-/workspace/parameter-golf}"
 WORKROOT="${WORKROOT:-/tmp/pg-run}"
 REPO_COPY="${WORKROOT}/repo"
 LOG_DIR="${WORKROOT}/logs"
+SHIM_DIR="${WORKROOT}/shim"
 DATA_PATH="${DATA_PATH:-${REPO_SRC}/data/datasets/fineweb10B_sp1024}"
 TOKENIZER_PATH="${TOKENIZER_PATH:-${REPO_SRC}/data/tokenizers/fineweb_1024_bpe.model}"
 HF_HOME="${HF_HOME:-/workspace/.cache/huggingface}"
@@ -26,9 +27,37 @@ VOCAB_SIZE="${VOCAB_SIZE:-1024}"
 OFFICIAL_RUN_ID="${OFFICIAL_RUN_ID:-official_same_setup_1xh100}"
 CURRENT_RUN_ID="${CURRENT_RUN_ID:-current_same_setup_1xh100}"
 
-mkdir -p "${WORKROOT}" "${LOG_DIR}" "${HF_HOME}"
+mkdir -p "${WORKROOT}" "${LOG_DIR}" "${SHIM_DIR}" "${HF_HOME}"
 rm -rf "${REPO_COPY}"
 mkdir -p "${REPO_COPY}"
+
+cat > "${SHIM_DIR}/sitecustomize.py" <<'PY'
+import inspect
+
+import torch.nn.functional as F
+
+_orig = F.scaled_dot_product_attention
+try:
+    _has_enable_gqa = "enable_gqa" in inspect.signature(_orig).parameters
+except Exception:
+    _has_enable_gqa = True
+
+if not _has_enable_gqa:
+    def _compat_scaled_dot_product_attention(query, key, value, *args, **kwargs):
+        enable_gqa = kwargs.pop("enable_gqa", False)
+        if enable_gqa:
+            q_heads = query.shape[-3]
+            kv_heads = key.shape[-3]
+            if q_heads % kv_heads != 0:
+                raise ValueError(f"q_heads={q_heads} must be divisible by kv_heads={kv_heads}")
+            if q_heads != kv_heads:
+                repeats = q_heads // kv_heads
+                key = key.repeat_interleave(repeats, dim=-3)
+                value = value.repeat_interleave(repeats, dim=-3)
+        return _orig(query, key, value, *args, **kwargs)
+
+    F.scaled_dot_product_attention = _compat_scaled_dot_product_attention
+PY
 
 if command -v rsync >/dev/null 2>&1; then
   rsync -a --delete \
@@ -53,6 +82,7 @@ run_job() {
     cd "${REPO_COPY}"
     env \
       HF_HOME="${HF_HOME}" \
+      PYTHONPATH="${SHIM_DIR}${PYTHONPATH:+:${PYTHONPATH}}" \
       RUN_ID="${run_id}" \
       DATA_PATH="${DATA_PATH}" \
       TOKENIZER_PATH="${TOKENIZER_PATH}" \
