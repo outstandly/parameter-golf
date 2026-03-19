@@ -84,6 +84,7 @@ class Hyperparameters:
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
+    muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", 0.0))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
@@ -116,10 +117,18 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
 
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
+    def __init__(
+        self,
+        params,
+        lr: float,
+        momentum: float,
+        backend_steps: int,
+        weight_decay: float = 0.0,
+        nesterov: bool = True,
+    ):
         super().__init__(
             params,
-            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
+            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, weight_decay=weight_decay, nesterov=nesterov),
         )
         self._group_offsets: list[list[tuple[int, int]]] = []
         self._flat_buffers: list[Tensor | None] = []
@@ -169,6 +178,7 @@ class Muon(torch.optim.Optimizer):
             lr = group["lr"]
             momentum = group["momentum"]
             backend_steps = group["backend_steps"]
+            weight_decay = group["weight_decay"]
             nesterov = group["nesterov"]
             if world_size == 1:
                 for p in params:
@@ -186,6 +196,8 @@ class Muon(torch.optim.Optimizer):
                     g *= max(1, g.size(0) / g.size(1)) ** 0.5
                     if g.dtype != p.dtype:
                         g = g.to(dtype=p.dtype)
+                    if weight_decay > 0:
+                        p.mul_(1.0 - lr * weight_decay)
                     p.add_(g, alpha=-lr)
                 continue
 
@@ -218,6 +230,8 @@ class Muon(torch.optim.Optimizer):
                 g = updates_flat[start:end].view_as(p)
                 if g.dtype != p.dtype:
                     g = g.to(dtype=p.dtype)
+                if weight_decay > 0:
+                    p.mul_(1.0 - lr * weight_decay)
                 p.add_(g, alpha=-lr)
 
         return loss
@@ -1184,6 +1198,7 @@ def main() -> None:
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
+        weight_decay=args.muon_weight_decay,
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
