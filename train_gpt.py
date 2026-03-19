@@ -348,7 +348,7 @@ INT8_KEEP_FLOAT_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "INT8_KEEP_FLOAT_NAME_PATTERNS",
-        "tok_emb.weight,blocks.8.mlp.fc.weight,blocks.8.mlp.proj.weight,blocks.8.attn.proj.weight",
+        "tok_emb.weight",
     ).split(",")
     if pattern
 )
