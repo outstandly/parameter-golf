@@ -81,9 +81,11 @@ path = Path(sys.argv[1])
 text = path.read_text()
 
 helper = """
+_orig_scaled_dot_product_attention = F.scaled_dot_product_attention
+
 def scaled_dot_product_attention_compat(query, key, value, **kwargs):
     try:
-        return F.scaled_dot_product_attention(query, key, value, **kwargs)
+        return _orig_scaled_dot_product_attention(query, key, value, **kwargs)
     except TypeError:
         enable_gqa = kwargs.pop("enable_gqa", False)
         if enable_gqa:
@@ -95,7 +97,7 @@ def scaled_dot_product_attention_compat(query, key, value, **kwargs):
                 repeats = q_heads // kv_heads
                 key = key.repeat_interleave(repeats, dim=-3)
                 value = value.repeat_interleave(repeats, dim=-3)
-        return F.scaled_dot_product_attention(query, key, value, **kwargs)
+        return _orig_scaled_dot_product_attention(query, key, value, **kwargs)
 """
 
 if "def scaled_dot_product_attention_compat(" not in text:
