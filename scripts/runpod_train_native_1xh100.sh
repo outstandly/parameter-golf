@@ -25,6 +25,7 @@ log_path="${LOG_DIR}/${RUN_ID}.txt"
 
 (
   cd "${REPO_COPY}"
+  set +e
   env \
     HF_HOME="${HF_HOME}" \
     RUN_ID="${RUN_ID}" \
@@ -36,7 +37,11 @@ log_path="${LOG_DIR}/${RUN_ID}.txt"
     MAX_WALLCLOCK_SECONDS="${MAX_WALLCLOCK_SECONDS}" \
     "$@" \
     torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" train_gpt.py
+  run_status=$?
+  set -e
+  exit "${run_status}"
 ) | tee "${log_path}"
+run_status=${PIPESTATUS[0]}
 
 if [[ -f "${REPO_COPY}/final_model.pt" ]]; then
   cp "${REPO_COPY}/final_model.pt" "${ARTIFACT_DIR}/${RUN_ID}.final_model.pt"
@@ -52,3 +57,5 @@ grep "layers:" "${log_path}" | tail -n 1 || true
 grep "final_int8_zlib_roundtrip_exact" "${log_path}" | tail -n 1 || true
 grep "Total submission size int8+zlib:" "${log_path}" | tail -n 1 || true
 ls -lh "${ARTIFACT_DIR}/${RUN_ID}".final_model* 2>/dev/null || true
+
+exit "${run_status}"
