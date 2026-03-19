@@ -50,6 +50,10 @@ class Hyperparameters:
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+    eval_mode = os.environ.get("EVAL_MODE", "chunked")
+    eval_doc_isolated = bool(int(os.environ.get("EVAL_DOC_ISOLATED", "0")))
+    eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
+    eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
@@ -255,26 +259,27 @@ def build_sentencepiece_luts(
     )
 
 
-def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
+def load_validation_tokens(pattern: str) -> Tensor:
     files = [Path(p) for p in sorted(glob.glob(pattern))]
     if not files:
         raise FileNotFoundError(f"No files found for pattern: {pattern}")
     # The export pipeline writes the fixed first-50k-doc validation set to fineweb_val_*.
     tokens = torch.cat([load_data_shard(file) for file in files]).contiguous()
-    usable = ((tokens.numel() - 1) // seq_len) * seq_len
-    if usable <= 0:
-        raise ValueError(f"Validation split is too short for TRAIN_SEQ_LEN={seq_len}")
-    return tokens[: usable + 1]
+    if tokens.numel() <= 1:
+        raise ValueError("Validation split is too short")
+    return tokens
 
 
 def eval_val(
     args: Hyperparameters,
     model: nn.Module,
+    eval_model: nn.Module,
     rank: int,
     world_size: int,
     device: torch.device,
     grad_accum_steps: int,
     val_tokens: Tensor,
+    bos_token_id: int,
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
@@ -283,39 +288,130 @@ def eval_val(
     # - val_loss: token cross-entropy (natural log)
     # - val_bpb: tokenizer-agnostic compression metric used by the challenge
     local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
-    if local_batch_tokens < args.train_seq_len:
+    if local_batch_tokens <= 0:
         raise ValueError(
-            "VAL_BATCH_SIZE must provide at least one sequence per rank; "
-            f"got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, "
-            f"GRAD_ACCUM_STEPS={grad_accum_steps}, TRAIN_SEQ_LEN={args.train_seq_len}"
+            f"VAL_BATCH_SIZE={args.val_batch_size} must provide positive local tokens for "
+            f"WORLD_SIZE={world_size} and GRAD_ACCUM_STEPS={grad_accum_steps}"
         )
-    local_batch_seqs = local_batch_tokens // args.train_seq_len
-    total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
-    seq_start = (total_seqs * rank) // world_size
-    seq_end = (total_seqs * (rank + 1)) // world_size
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
+    fast_chunked_eval = (
+        args.eval_mode == "chunked"
+        and not args.eval_doc_isolated
+        and args.eval_seq_len == args.train_seq_len
+    )
     model.eval()
+    eval_model.eval()
     with torch.inference_mode():
-        for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
-            batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
-            raw_start = batch_seq_start * args.train_seq_len
-            raw_end = batch_seq_end * args.train_seq_len + 1
-            local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
-            x = local[:-1].reshape(-1, args.train_seq_len)
-            y = local[1:].reshape(-1, args.train_seq_len)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss = model(x, y).detach()
-            batch_token_count = float(y.numel())
-            val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
-            val_token_count += batch_token_count
-            prev_ids = x.reshape(-1)
-            tgt_ids = y.reshape(-1)
-            token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
-            token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
-            val_byte_count += token_bytes.to(torch.float64).sum()
+        if fast_chunked_eval:
+            if local_batch_tokens < args.train_seq_len:
+                raise ValueError(
+                    "VAL_BATCH_SIZE must provide at least one sequence per rank; "
+                    f"got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, "
+                    f"GRAD_ACCUM_STEPS={grad_accum_steps}, TRAIN_SEQ_LEN={args.train_seq_len}"
+                )
+            local_batch_seqs = local_batch_tokens // args.train_seq_len
+            total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
+            seq_start = (total_seqs * rank) // world_size
+            seq_end = (total_seqs * (rank + 1)) // world_size
+            usable = total_seqs * args.train_seq_len + 1
+            val_tokens = val_tokens[:usable]
+            for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
+                batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
+                raw_start = batch_seq_start * args.train_seq_len
+                raw_end = batch_seq_end * args.train_seq_len + 1
+                local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
+                x = local[:-1].reshape(-1, args.train_seq_len)
+                y = local[1:].reshape(-1, args.train_seq_len)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    batch_loss = model(x, y).detach()
+                batch_token_count = float(y.numel())
+                val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
+                val_token_count += batch_token_count
+                prev_ids = x.reshape(-1)
+                tgt_ids = y.reshape(-1)
+                token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
+                token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
+                val_byte_count += token_bytes.to(torch.float64).sum()
+        else:
+            if args.eval_mode not in {"chunked", "sliding"}:
+                raise ValueError(f"Unsupported EVAL_MODE={args.eval_mode}")
+            if not args.eval_doc_isolated:
+                raise ValueError("Custom eval path currently requires EVAL_DOC_ISOLATED=1")
+            if bos_token_id < 0:
+                raise ValueError("SentencePiece tokenizer must define BOS for doc-isolated eval")
+            if args.eval_seq_len <= 0:
+                raise ValueError(f"EVAL_SEQ_LEN must be positive, got {args.eval_seq_len}")
+            if args.eval_mode == "sliding" and args.eval_stride <= 0:
+                raise ValueError(f"EVAL_STRIDE must be positive for sliding eval, got {args.eval_stride}")
+
+            doc_starts = (val_tokens == bos_token_id).nonzero(as_tuple=False).flatten().tolist()
+            if not doc_starts:
+                raise ValueError("Could not find any BOS-delimited validation documents")
+            if doc_starts[0] != 0:
+                doc_starts.insert(0, 0)
+            doc_ends = [*doc_starts[1:], int(val_tokens.numel())]
+            doc_ranges = list(zip(doc_starts, doc_ends, strict=True))
+            doc_start = (len(doc_ranges) * rank) // world_size
+            doc_end = (len(doc_ranges) * (rank + 1)) // world_size
+            chunk_targets = args.eval_seq_len if args.eval_mode == "chunked" else args.eval_stride
+            batch_items: list[tuple[Tensor, Tensor, int]] = []
+            batch_input_tokens = 0
+
+            def flush_batch() -> None:
+                nonlocal batch_items, batch_input_tokens, val_loss_sum, val_token_count, val_byte_count
+                if not batch_items:
+                    return
+                max_len = max(x.numel() for x, _, _ in batch_items)
+                pad_id = 0
+                x_batch = torch.full((len(batch_items), max_len), pad_id, device=device, dtype=torch.int64)
+                y_batch = torch.full((len(batch_items), max_len), pad_id, device=device, dtype=torch.int64)
+                score_mask = torch.zeros((len(batch_items), max_len), device=device, dtype=torch.bool)
+                for i, (x, y, score_start) in enumerate(batch_items):
+                    n = x.numel()
+                    x_batch[i, :n] = x.to(device=device, dtype=torch.int64, non_blocking=True)
+                    y_batch[i, :n] = y.to(device=device, dtype=torch.int64, non_blocking=True)
+                    score_mask[i, score_start:n] = True
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    logits = eval_model.forward_logits(x_batch)
+                per_token_loss = F.cross_entropy(
+                    logits.float().reshape(-1, logits.size(-1)),
+                    y_batch.reshape(-1),
+                    reduction="none",
+                ).reshape_as(y_batch)
+                val_loss_sum += per_token_loss[score_mask].to(torch.float64).sum()
+                val_token_count += score_mask.sum().to(torch.float64)
+                prev_ids = x_batch[score_mask]
+                tgt_ids = y_batch[score_mask]
+                token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
+                token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
+                val_byte_count += token_bytes.to(torch.float64).sum()
+                batch_items = []
+                batch_input_tokens = 0
+
+            for raw_start, raw_end in doc_ranges[doc_start:doc_end]:
+                doc = val_tokens[raw_start:raw_end]
+                doc_len = int(doc.numel())
+                if doc_len <= 1:
+                    continue
+                target_start = 1
+                while target_start < doc_len:
+                    target_end = min(target_start + chunk_targets, doc_len)
+                    context_start = target_start - 1
+                    if args.eval_mode == "sliding":
+                        context_start = max(0, target_end - args.eval_seq_len - 1)
+                    window = doc[context_start:target_end]
+                    x = window[:-1]
+                    y = window[1:]
+                    score_start = target_start - (context_start + 1)
+                    if batch_items and batch_input_tokens + int(x.numel()) > local_batch_tokens:
+                        flush_batch()
+                    batch_items.append((x, y, score_start))
+                    batch_input_tokens += int(x.numel())
+                    target_start = target_end
+            flush_batch()
 
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
@@ -864,7 +960,7 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -902,16 +998,19 @@ class GPT(nn.Module):
                     x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
                 x = self.blocks[layer_idx](x, x0)
 
-        x = self.final_norm(x).reshape(-1, x.size(-1))
-        targets = target_ids.reshape(-1)
+        x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
-        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+        return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        logits = self.forward_logits(input_ids)
+        targets = target_ids.reshape(-1)
+        return F.cross_entropy(logits.float().reshape(-1, logits.size(-1)), targets, reduction="mean")
 
 
 # -----------------------------
@@ -1001,13 +1100,18 @@ def main() -> None:
         )
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
-    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
+    val_tokens = load_validation_tokens(args.val_files)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
     )
+    bos_token_id = int(sp.bos_id())
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
+    log0(
+        f"eval_config:mode={args.eval_mode} doc_isolated={int(args.eval_doc_isolated)} "
+        f"eval_seq_len={args.eval_seq_len} eval_stride={args.eval_stride}"
+    )
 
     # -----------------------------
     # MODEL + OPTIMIZER SETUP
@@ -1179,11 +1283,13 @@ def main() -> None:
             val_loss, val_bpb = eval_val(
                 args,
                 model,
+                base_model,
                 rank,
                 world_size,
                 device,
                 grad_accum_steps,
                 val_tokens,
+                bos_token_id,
                 base_bytes_lut,
                 has_leading_space_lut,
                 is_boundary_token_lut,
@@ -1336,11 +1442,13 @@ def main() -> None:
     q_val_loss, q_val_bpb = eval_val(
         args,
         model,
+        base_model,
         rank,
         world_size,
         device,
         grad_accum_steps,
         val_tokens,
+        bos_token_id,
         base_bytes_lut,
         has_leading_space_lut,
         is_boundary_token_lut,
