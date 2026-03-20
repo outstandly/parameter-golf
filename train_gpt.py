@@ -1166,13 +1166,13 @@ def main() -> None:
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
     ).to(device).bfloat16()
-    if args.load_state_dict_path:
-        state_dict = torch.load(args.load_state_dict_path, map_location="cpu")
-        base_model.load_state_dict(state_dict, strict=True)
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
+    if args.load_state_dict_path:
+        state_dict = torch.load(args.load_state_dict_path, map_location="cpu")
+        base_model.load_state_dict(state_dict, strict=True)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
