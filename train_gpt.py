@@ -42,6 +42,7 @@ class Hyperparameters:
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+    skip_preexport_eval = bool(int(os.environ.get("SKIP_PREEXPORT_EVAL", "0")))
     eval_mode = os.environ.get("EVAL_MODE", "chunked")
     eval_doc_isolated = bool(int(os.environ.get("EVAL_DOC_ISOLATED", "0")))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
@@ -1297,28 +1298,35 @@ def main() -> None:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
         should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
+        skip_validate = last_step and step == 0 and args.skip_preexport_eval
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
-            val_loss, val_bpb = eval_val(
-                args,
-                model,
-                base_model,
-                rank,
-                world_size,
-                device,
-                grad_accum_steps,
-                val_tokens,
-                bos_token_id,
-                base_bytes_lut,
-                has_leading_space_lut,
-                is_boundary_token_lut,
-            )
-            log0(
-                f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
-                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
-            )
-            torch.cuda.synchronize()
+            if skip_validate:
+                log0(
+                    f"step:{step}/{args.iterations} preexport_eval_skipped:1 "
+                    f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
+                )
+            else:
+                val_loss, val_bpb = eval_val(
+                    args,
+                    model,
+                    base_model,
+                    rank,
+                    world_size,
+                    device,
+                    grad_accum_steps,
+                    val_tokens,
+                    bos_token_id,
+                    base_bytes_lut,
+                    has_leading_space_lut,
+                    is_boundary_token_lut,
+                )
+                log0(
+                    f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
+                    f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
+                )
+                torch.cuda.synchronize()
             t0 = time.perf_counter()
 
         if last_step:
