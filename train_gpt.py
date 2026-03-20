@@ -467,20 +467,11 @@ INT8_KEEP_FLOAT_NAME_PATTERNS = tuple(
     ).split(",")
     if pattern
 )
+INT8_KEEP_FLOAT_PATTERN_CANDIDATES_ENV = os.environ.get("INT8_KEEP_FLOAT_PATTERN_CANDIDATES", "")
 INT8_KEEP_FLOAT_PATTERN_CANDIDATES = tuple(
     tuple(pattern for pattern in candidate.split(",") if pattern)
-    for candidate in os.environ.get(
-        "INT8_KEEP_FLOAT_PATTERN_CANDIDATES",
-        (
-            "tok_emb.weight,blocks.8.mlp.fc.weight,blocks.8.mlp.proj.weight,blocks.8.attn.proj.weight;"
-            "tok_emb.weight,blocks.8.mlp.fc.weight,blocks.8.mlp.proj.weight;"
-            "tok_emb.weight,blocks.8.mlp.fc.weight,blocks.8.attn.proj.weight;"
-            "tok_emb.weight,blocks.8.mlp.fc.weight;"
-            "tok_emb.weight,blocks.8.mlp.proj.weight;"
-            "tok_emb.weight,blocks.8.attn.proj.weight;"
-            "tok_emb.weight;"
-        ),
-    ).split(";")
+    for candidate in INT8_KEEP_FLOAT_PATTERN_CANDIDATES_ENV.split(";")
+    if candidate
 )
 INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
     pattern
@@ -497,6 +488,18 @@ INT8_GROUP_SIZE = int(os.environ.get("INT8_GROUP_SIZE", 2))
 INT8_CLIP_PERCENTILE = float(os.environ.get("INT8_CLIP_PERCENTILE", 99.99995))
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
 INT8_SUBMISSION_SIZE_LIMIT_BYTES = int(os.environ.get("INT8_SUBMISSION_SIZE_LIMIT_BYTES", 16_000_000))
+
+def default_keep_float_pattern_candidates(num_layers: int) -> tuple[tuple[str, ...], ...]:
+    last_block = max(num_layers - 1, 0)
+    return (
+        ("tok_emb.weight", f"blocks.{last_block}.mlp.fc.weight", f"blocks.{last_block}.mlp.proj.weight", f"blocks.{last_block}.attn.proj.weight"),
+        ("tok_emb.weight", f"blocks.{last_block}.mlp.fc.weight", f"blocks.{last_block}.mlp.proj.weight"),
+        ("tok_emb.weight", f"blocks.{last_block}.mlp.fc.weight", f"blocks.{last_block}.attn.proj.weight"),
+        ("tok_emb.weight", f"blocks.{last_block}.mlp.fc.weight"),
+        ("tok_emb.weight", f"blocks.{last_block}.mlp.proj.weight"),
+        ("tok_emb.weight", f"blocks.{last_block}.attn.proj.weight"),
+        ("tok_emb.weight",),
+    )
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
@@ -1424,7 +1427,11 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_candidates = INT8_KEEP_FLOAT_PATTERN_CANDIDATES if INT8_KEEP_FLOAT_PATTERN_CANDIDATES else (INT8_KEEP_FLOAT_NAME_PATTERNS,)
+    quant_candidates = (
+        INT8_KEEP_FLOAT_PATTERN_CANDIDATES
+        if INT8_KEEP_FLOAT_PATTERN_CANDIDATES
+        else default_keep_float_pattern_candidates(args.num_layers)
+    )
     seen_candidates: set[tuple[str, ...]] = set()
     ordered_candidates: list[tuple[str, ...]] = []
     for candidate in [*quant_candidates, INT8_KEEP_FLOAT_NAME_PATTERNS, tuple()]:
