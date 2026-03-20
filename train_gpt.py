@@ -84,6 +84,7 @@ class Hyperparameters:
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
+    adam_weight_decay = float(os.environ.get("ADAM_WEIGHT_DECAY", 0.0))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
@@ -979,6 +980,16 @@ class GPT(nn.Module):
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
+        if int(os.environ.get("PHASE_TRANSITION_RESID_INIT", "0")):
+            num_layers = len(self.blocks) if not self.uses_shared_layer_weights else self.num_encoder_layers + self.num_decoder_layers
+            for i in range(num_layers):
+                phase = torch.sigmoid(torch.tensor(3.0 * (i / max(num_layers - 1, 1) - 0.5), dtype=torch.float32))
+                if self.uses_shared_layer_weights:
+                    self.resid_mixes.data[i, 0].fill_(phase.item())
+                    self.resid_mixes.data[i, 1].fill_(1.0 - phase.item())
+                else:
+                    self.blocks[i].resid_mix.data[0].fill_(phase.item())
+                    self.blocks[i].resid_mix.data[1].fill_(1.0 - phase.item())
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
@@ -1182,10 +1193,11 @@ def main() -> None:
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-    optimizer_tok = torch.optim.Adam(
+    optimizer_tok = torch.optim.AdamW(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
+        weight_decay=args.adam_weight_decay,
         fused=True,
     )
     optimizer_muon = Muon(
@@ -1197,10 +1209,11 @@ def main() -> None:
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
-    optimizer_scalar = torch.optim.Adam(
+    optimizer_scalar = torch.optim.AdamW(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
+        weight_decay=args.adam_weight_decay,
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
@@ -1222,7 +1235,11 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} adam_wd:{args.adam_weight_decay}"
+    )
+    log0(
+        f"init_flags:overtone={int(os.environ.get('OVERTONE_EMBED_INIT', '0'))} "
+        f"phase_transition_resid={int(os.environ.get('PHASE_TRANSITION_RESID_INIT', '0'))}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
