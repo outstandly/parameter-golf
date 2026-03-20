@@ -47,6 +47,7 @@ class Hyperparameters:
     eval_doc_isolated = bool(int(os.environ.get("EVAL_DOC_ISOLATED", "0")))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", 1024)))
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
+    eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 256))
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
@@ -343,7 +344,7 @@ def eval_val(
                     p += args.eval_stride
                 per_rank = (len(windows) + world_size - 1) // world_size
                 my_windows = windows[rank * per_rank : min((rank + 1) * per_rank, len(windows))]
-                eval_batch_seqs = 256
+                eval_batch_seqs = args.eval_batch_seqs
                 for i in range(0, len(my_windows), eval_batch_seqs):
                     batch = my_windows[i : i + eval_batch_seqs]
                     if not batch:
